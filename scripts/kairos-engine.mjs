@@ -5,9 +5,19 @@
  * Default mode: dry-run (paper trading)
  */
 
-import { spawnSync } from 'child_process';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
+import {
+  validateSymbol,
+  validateSymbolList,
+  validateSetup,
+  hlCmd,
+  hlPost as safeHlPost,
+  fetchJsonWithTimeout,
+  calcSize as safeCalcSize,
+  atomicWriteJson,
+  checkHaltFile,
+} from './lib/safety.mjs';
 
 // ══════════════════════════════════════════════════════
 // CONFIG
@@ -79,7 +89,7 @@ function loadState() {
       peakBalance: 0,
       tradeHistory: [],
     };
-    writeFileSync(STATE_FILE, JSON.stringify(initial, null, 2));
+    atomicWriteJson(STATE_FILE, initial);
     return initial;
   }
   const state = JSON.parse(readFileSync(STATE_FILE, 'utf8'));
@@ -93,8 +103,7 @@ function loadState() {
 }
 
 function saveState(state) {
-  if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  atomicWriteJson(STATE_FILE, state);
 }
 
 // ══════════════════════════════════════════════════════
@@ -243,13 +252,7 @@ function bollingerWidthHistory(closes, period = 20) {
 const HL_API = 'https://api.hyperliquid.xyz/info';
 
 async function hlPost(body) {
-  const res = await fetch(HL_API, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`Hyperliquid API ${res.status}: ${await res.text()}`);
-  return res.json();
+  return safeHlPost(HL_API, body, { timeoutMs: 10000 });
 }
 
 async function fetchCandles(symbol, interval, lookbackMs) {
@@ -280,41 +283,40 @@ async function fetchFundingRate(symbol) {
 
 async function fetchFearGreed() {
   try {
-    const res = await fetch('https://api.alternative.me/fng/?limit=1');
-    const data = await res.json();
-    return parseInt(data.data[0].value, 10);
+    const data = await fetchJsonWithTimeout('https://api.alternative.me/fng/?limit=1', { timeoutMs: 8000 });
+    const v = parseInt(data?.data?.[0]?.value, 10);
+    return Number.isFinite(v) ? v : 50;
   } catch {
     return 50; // neutral fallback
   }
 }
 
 // ══════════════════════════════════════════════════════
-// HYPERLIQUID CLI WRAPPER
+// HYPERLIQUID CLI WRAPPER — uses safe variadic hlCmd from safety lib
 // ══════════════════════════════════════════════════════
-
-function hlCmd(argsStr) {
-  const parts = argsStr.trim().split(/\s+/);
-  const result = spawnSync('hyperliquid', parts, { encoding: 'utf8', timeout: 15000 });
-  if (result.error) throw new Error(`hyperliquid CLI not available: ${result.error.message}`);
-  if (result.status !== 0) throw new Error(`hyperliquid CLI failed: ${(result.stderr || '').trim()}`);
-  return result.stdout.trim();
-}
 
 function getBalance(state) {
   try {
-    const out = hlCmd('balance --json');
+    const out = hlCmd('balance', '--json');
     const data = JSON.parse(out);
-    return parseFloat(data.total ?? data.balance ?? data.equity ?? 1000);
-  } catch {
-    if (CONFIG.mode === 'live') throw new Error('Cannot fetch balance for live trading');
-    return 1000; // dry-run mock
+    const raw = data.total ?? data.balance ?? data.equity;
+    const val = parseFloat(raw);
+    if (!Number.isFinite(val) || val <= 0) {
+      if (CONFIG.mode === 'live') throw new Error(`Unrecognized balance response: ${out.slice(0, 120)}`);
+      return 1000;
+    }
+    return val;
+  } catch (e) {
+    if (CONFIG.mode === 'live') throw new Error(`Cannot fetch balance for live trading: ${e.message}`);
+    return 1000; // dry-run mock only
   }
 }
 
 function getOpenPositions(state) {
   try {
-    const out = hlCmd('perp positions --json');
-    return JSON.parse(out);
+    const out = hlCmd('perp', 'positions', '--json');
+    const parsed = JSON.parse(out);
+    return Array.isArray(parsed) ? parsed : Object.values(state.positions || {});
   } catch {
     return Object.values(state.positions || {});
   }
@@ -584,22 +586,26 @@ function getConvictionTier(score) {
     ?? CONFIG.convictionTiers[0];
 }
 
-function calcSize(balance, riskPct, slDistance, entryPrice) {
-  // Risk dollar amount = balance × riskPct
-  // Position notional = riskAmount / (slDistance / entryPrice)
-  const riskAmount     = balance * riskPct;
-  const slPct          = slDistance / entryPrice;
-  const positionNotional = riskAmount / slPct;
-  const size           = positionNotional / entryPrice;
-  return Math.max(Math.round(size * 10000) / 10000, 0.001);
-}
-
 async function runExecutor(setup, state) {
+  // SECURITY: Validate setup before touching the wallet.
+  const validationError = validateSetup(setup);
+  if (validationError) {
+    console.error(`  [EXECUTOR] ✗ Rejected invalid setup: ${validationError}`);
+    return { executed: false, error: `invalid setup: ${validationError}` };
+  }
+
+  // SECURITY: authoritative mode is the persisted state — never CLI arg.
+  const activeMode = state.mode === 'live' ? 'live' : 'dry-run';
+
   const convictionScore = Math.min(100, setup.confidence + (setup.confluenceCount - CONFIG.minConfluence) * 8);
   const tier    = getConvictionTier(convictionScore);
   const balance = getBalance(state);
   const leverage = Math.min(tier.leverage, CONFIG.maxLeverage);
-  const size     = calcSize(balance, tier.riskPct, setup.slDistance, setup.entryPrice);
+  const size     = safeCalcSize(balance, tier.riskPct, setup.slDistance, setup.entryPrice);
+  if (size === null) {
+    console.error('  [EXECUTOR] ✗ Unsafe position size calculation — aborting');
+    return { executed: false, error: 'calcSize produced unsafe result' };
+  }
   const side     = setup.direction === 'LONG' ? 'buy' : 'sell';
   const closeSide = side === 'buy' ? 'sell' : 'buy';
   const symbolPerp = `${setup.symbol}-PERP`;
@@ -611,6 +617,7 @@ async function runExecutor(setup, state) {
     slPrice:        setup.slPrice,
     tpPrice:        setup.tpPrice,
     slDistance:     setup.slDistance,
+    atr:            setup.atr,
     size,
     leverage,
     tier:           tier.name,
@@ -620,9 +627,10 @@ async function runExecutor(setup, state) {
     openedAt:       Date.now(),
     stepLocked:     0,
     phase:          'INITIAL',
+    status:         'pending',
   };
 
-  if (CONFIG.mode === 'dry-run') {
+  if (activeMode === 'dry-run') {
     const notional = +(size * setup.entryPrice * leverage).toFixed(2);
     console.log(`  ┌─ [DRY-RUN] ${tier.name} — ${setup.direction} ${setup.symbol}`);
     console.log(`  │  Entry: ${setup.entryPrice} | SL: ${setup.slPrice} | TP: ${setup.tpPrice}`);
@@ -631,6 +639,7 @@ async function runExecutor(setup, state) {
     console.log(`  └─ Confluence: ${setup.confluenceCount}/9 | Confidence: ${setup.confidence}%`);
 
     state.dailyTrades++;
+    orderInfo.status = 'open';
     state.positions[setup.symbol] = orderInfo;
     saveState(state);
     return { executed: false, dryRun: true, orderInfo };
@@ -638,21 +647,70 @@ async function runExecutor(setup, state) {
 
   // ── LIVE EXECUTION ──
   console.log(`  [LIVE] ${tier.name} — Placing ${setup.direction} ${setup.symbol}...`);
+
+  // Step 1: Persist intent BEFORE the order so a crash between order + SL
+  // still leaves a breadcrumb for the risk-manager to discover and close.
+  state.positions[setup.symbol] = orderInfo;
+  saveState(state);
+
   try {
-    hlCmd(`perp order ${symbolPerp} --side ${side} --size ${size} --leverage ${leverage}`);
+    hlCmd('perp', 'order', symbolPerp, '--side', side, '--size', String(size), '--leverage', String(leverage));
     console.log(`  [EXECUTOR] ✓ Position opened`);
-
-    hlCmd(`perp order ${symbolPerp} --side ${closeSide} --size ${size} --reduce-only --order-type stop --trigger-price ${setup.slPrice}`);
-    console.log(`  [EXECUTOR] ✓ Stop-loss set at ${setup.slPrice}`);
-
-    state.dailyTrades++;
+    orderInfo.status = 'open_no_sl';
     state.positions[setup.symbol] = orderInfo;
     saveState(state);
-    return { executed: true, dryRun: false, orderInfo };
   } catch (e) {
-    console.error(`  [EXECUTOR] ✗ Order failed: ${e.message}`);
-    return { executed: false, error: e.message };
+    // Entry failed — remove the pending breadcrumb and abort.
+    delete state.positions[setup.symbol];
+    saveState(state);
+    console.error(`  [EXECUTOR] ✗ Entry order failed: ${e.message}`);
+    return { executed: false, error: `entry: ${e.message}` };
   }
+
+  // Step 2: Place SL. If it fails, emergency-close the position — a naked
+  // position is unacceptable. Retry SL once, then close if both attempts fail.
+  let slPlaced = false;
+  let slError = null;
+  for (let attempt = 1; attempt <= 2 && !slPlaced; attempt++) {
+    try {
+      hlCmd('perp', 'order', symbolPerp,
+        '--side', closeSide,
+        '--size', String(size),
+        '--reduce-only',
+        '--order-type', 'stop',
+        '--trigger-price', String(setup.slPrice));
+      slPlaced = true;
+      console.log(`  [EXECUTOR] ✓ Stop-loss set at ${setup.slPrice}`);
+    } catch (e) {
+      slError = e.message;
+      console.error(`  [EXECUTOR] ✗ SL attempt ${attempt} failed: ${e.message}`);
+    }
+  }
+
+  if (!slPlaced) {
+    console.error('  [EXECUTOR] ⚠ SL placement failed — emergency closing naked position');
+    try {
+      hlCmd('perp', 'close', symbolPerp);
+      console.error('  [EXECUTOR] ✓ Emergency close succeeded');
+    } catch (closeErr) {
+      console.error(`  [EXECUTOR] ✗✗ EMERGENCY CLOSE FAILED — MANUAL INTERVENTION REQUIRED: ${closeErr.message}`);
+      orderInfo.status = 'ORPHAN_NO_SL';
+      orderInfo.alert = 'Naked position — manual close required';
+      state.positions[setup.symbol] = orderInfo;
+      saveState(state);
+    }
+    if (orderInfo.status !== 'ORPHAN_NO_SL') {
+      delete state.positions[setup.symbol];
+      saveState(state);
+    }
+    return { executed: false, error: `sl: ${slError}` };
+  }
+
+  state.dailyTrades++;
+  orderInfo.status = 'open';
+  state.positions[setup.symbol] = orderInfo;
+  saveState(state);
+  return { executed: true, dryRun: false, orderInfo };
 }
 
 // ══════════════════════════════════════════════════════
@@ -660,6 +718,14 @@ async function runExecutor(setup, state) {
 // ══════════════════════════════════════════════════════
 
 async function runCycle(symbols) {
+  // Kill switch — if `.kairos-data/HALT` exists, refuse to trade.
+  const haltMsg = checkHaltFile(STATE_DIR);
+  if (haltMsg) {
+    console.error(`[KAIROS] ⛔ HALT active: ${haltMsg}`);
+    console.error(`[KAIROS] Remove ${join(STATE_DIR, 'HALT')} to resume trading.`);
+    return;
+  }
+
   const state = loadState();
   CONFIG.mode = state.mode;
 
@@ -738,7 +804,13 @@ async function runCycle(symbols) {
 async function runAuto(symbols, durationMin = 60) {
   const endTime = Date.now() + durationMin * 60_000;
   console.log(`[AUTO] Starting autonomous trading for ${durationMin} minutes...`);
+  console.log(`[AUTO] Emergency stop: create ${join(STATE_DIR, 'HALT')} to halt at next boundary.`);
   while (Date.now() < endTime) {
+    const haltMsg = checkHaltFile(STATE_DIR);
+    if (haltMsg) {
+      console.error(`[AUTO] ⛔ HALT active: ${haltMsg} — stopping.`);
+      return;
+    }
     await runCycle(symbols);
     const remaining = Math.ceil((endTime - Date.now()) / 60_000);
     if (remaining <= 0) break;
@@ -789,13 +861,31 @@ const command = args[0];
 
 // Parse flags
 const symIdx  = args.indexOf('--symbols');
-const modeIdx = args.indexOf('--mode');
 const durIdx  = args.indexOf('--duration');
 const setupIdx = args.indexOf('--setup');
 
-const symbols  = symIdx !== -1  ? args[symIdx + 1].split(',')  : CONFIG.symbols;
-const duration = durIdx !== -1  ? parseInt(args[durIdx + 1])   : 60;
-if (modeIdx !== -1) CONFIG.mode = args[modeIdx + 1];
+// SECURITY: validate symbols — only uppercase alphanumerics, length 1-10
+const rawSymbols = symIdx !== -1 ? (args[symIdx + 1] ?? '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean) : CONFIG.symbols;
+if (!validateSymbolList(rawSymbols)) {
+  console.error(`[KAIROS] Invalid --symbols: each must match /^[A-Z0-9]{1,10}$/ and list length 1-30.`);
+  process.exit(1);
+}
+const symbols = rawSymbols;
+
+// SECURITY: cap --duration to 480 minutes (8h) to prevent runaway auto sessions
+const parsedDuration = durIdx !== -1 ? parseInt(args[durIdx + 1], 10) : 60;
+if (durIdx !== -1 && (!Number.isFinite(parsedDuration) || parsedDuration <= 0 || parsedDuration > 480)) {
+  console.error('[KAIROS] --duration must be a positive integer ≤ 480 minutes.');
+  process.exit(1);
+}
+const duration = Math.min(Math.max(parsedDuration || 60, 1), 480);
+
+// SECURITY: --mode CLI flag is intentionally removed. Mode is read from persisted
+// state only (via `config.mjs set-mode live --confirm`). This prevents dry-run bypass.
+if (args.indexOf('--mode') !== -1) {
+  console.error('[KAIROS] --mode flag is disabled. Use `node scripts/config.mjs set-mode <dry-run|live> --confirm` instead.');
+  process.exit(1);
+}
 
 switch (command) {
   case 'sentinel':
@@ -814,7 +904,11 @@ switch (command) {
 
   case 'guardian': {
     if (setupIdx === -1) { console.error('Usage: kairos-engine.mjs guardian --setup <JSON>'); process.exit(1); }
-    const setup = JSON.parse(args[setupIdx + 1]);
+    let setup;
+    try { setup = JSON.parse(args[setupIdx + 1]); }
+    catch (e) { console.error(`Invalid --setup JSON: ${e.message}`); process.exit(1); }
+    const verr = validateSetup(setup);
+    if (verr) { console.error(`Invalid setup: ${verr}`); process.exit(1); }
     const state = loadState();
     runGuardian(setup, state, getOpenPositions(state))
       .then(r => console.log(JSON.stringify(r, null, 2)))
@@ -824,8 +918,13 @@ switch (command) {
 
   case 'execute': {
     if (setupIdx === -1) { console.error('Usage: kairos-engine.mjs execute --setup <JSON>'); process.exit(1); }
-    const setup = JSON.parse(args[setupIdx + 1]);
+    let setup;
+    try { setup = JSON.parse(args[setupIdx + 1]); }
+    catch (e) { console.error(`Invalid --setup JSON: ${e.message}`); process.exit(1); }
+    const verr = validateSetup(setup);
+    if (verr) { console.error(`Invalid setup: ${verr}`); process.exit(1); }
     const state = loadState();
+    CONFIG.mode = state.mode === 'live' ? 'live' : 'dry-run';
     runExecutor(setup, state)
       .then(r => console.log(JSON.stringify(r, null, 2)))
       .catch(e => { console.error(e.message); process.exit(1); });
@@ -860,12 +959,16 @@ Commands:
   stats                 Show performance statistics
 
 Options:
-  --symbols BTC,ETH,SOL   Symbols to trade (default: BTC,ETH,SOL)
-  --mode dry-run|live     Override mode (default: from state)
-  --duration <min>        Auto mode duration in minutes (default: 60)
+  --symbols BTC,ETH,SOL   Symbols to trade (default: BTC,ETH,SOL, max 30)
+  --duration <min>        Auto mode duration (1-480 min, default: 60)
+
+Mode control:
+  Mode is read from persisted state only. To switch:
+    node scripts/config.mjs set-mode live --confirm
+    node scripts/config.mjs set-mode dry-run
 
 Examples:
-  node scripts/kairos-engine.mjs cycle --symbols BTC,ETH --mode dry-run
+  node scripts/kairos-engine.mjs cycle --symbols BTC,ETH
   node scripts/kairos-engine.mjs auto --duration 120
   node scripts/kairos-engine.mjs sentinel
 `);

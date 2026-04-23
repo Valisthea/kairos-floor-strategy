@@ -21,11 +21,13 @@ const FNG_API = 'https://api.alternative.me/fng/';
 // FETCH WITH RETRY
 // ══════════════════════════════════════════════════════
 
-async function fetchWithRetry(url, options = {}, maxRetries = 3) {
+async function fetchWithRetry(url, options = {}, maxRetries = 3, timeoutMs = 10000) {
   let lastError;
   for (let i = 0; i < maxRetries; i++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await fetch(url, { timeout: 10000, ...options });
+      const res = await fetch(url, { ...options, signal: controller.signal });
       if (res.status === 429) {
         const wait = (i + 1) * 2000;
         console.warn(`[MARKET-DATA] Rate limited. Waiting ${wait}ms...`);
@@ -39,6 +41,8 @@ async function fetchWithRetry(url, options = {}, maxRetries = 3) {
       if (i < maxRetries - 1) {
         await new Promise(r => setTimeout(r, (i + 1) * 1000));
       }
+    } finally {
+      clearTimeout(timer);
     }
   }
   throw lastError;

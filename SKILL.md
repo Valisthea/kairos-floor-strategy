@@ -32,7 +32,7 @@ and adaptive trailing stops with dollar-based step-lock protection.
 - This strategy can and will lose money. Past performance does not guarantee future results.
 - NEVER trade with funds you cannot afford to lose.
 - The strategy includes a DRY-RUN mode (default) for paper trading.
-- All positions have stop-loss protection. Maximum loss per trade is capped at 3% of capital.
+- All positions have stop-loss protection. Maximum loss per trade is capped at 2% of capital.
 - The author is not responsible for any financial losses incurred by using this strategy.
 - This is NOT financial advice. This is experimental autonomous trading software.
 

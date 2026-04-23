@@ -1,5 +1,6 @@
 # Runtime state (not for version control)
 .kairos-data/
+*.tmp.*
 
 # Node
 node_modules/

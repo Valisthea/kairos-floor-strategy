@@ -10,9 +10,9 @@
  *   node scripts/risk-manager.mjs reset-cooldown
  */
 
-import { spawnSync } from 'child_process';
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
+import { hlCmd, hlPost as safeHlPost, validateSymbol, atomicWriteJson } from './lib/safety.mjs';
 
 // ══════════════════════════════════════════════════════
 // CONFIG (mirrors kairos-engine config)
@@ -33,6 +33,7 @@ const RISK_CONFIG = {
 
   maxDrawdownPct:       15,
   dailyLossLimitPct:    5,
+  maxConsecutiveLosses: 5,
 };
 
 const STATE_DIR  = join(process.cwd(), '.kairos-data');
@@ -49,36 +50,23 @@ function loadState() {
 }
 
 function saveState(state) {
-  if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  atomicWriteJson(STATE_FILE, state);
 }
 
 // ══════════════════════════════════════════════════════
 // HELPERS
 // ══════════════════════════════════════════════════════
 
-function hlCmd(argsStr) {
-  const parts  = argsStr.trim().split(/\s+/);
-  const result = spawnSync('hyperliquid', parts, { encoding: 'utf8', timeout: 10000 });
-  if (result.error) throw new Error(`hyperliquid CLI: ${result.error.message}`);
-  if (result.status !== 0) throw new Error(`hyperliquid CLI: ${(result.stderr || '').trim()}`);
-  return result.stdout.trim();
-}
-
 async function hlPost(body) {
-  const res = await fetch(HL_API, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`HL API ${res.status}`);
-  return res.json();
+  return safeHlPost(HL_API, body, { timeoutMs: 10000 });
 }
 
 async function fetchCandles(symbol, interval, lookbackMs) {
+  if (!validateSymbol(symbol)) throw new Error(`invalid symbol: ${symbol}`);
   const endTime   = Date.now();
   const startTime = endTime - lookbackMs;
   const raw = await hlPost({ type: 'candleSnapshot', req: { coin: symbol, interval, startTime, endTime } });
+  if (!Array.isArray(raw)) return [];
   return raw.map(c => ({
     high:  parseFloat(c.h),
     low:   parseFloat(c.l),
@@ -120,23 +108,31 @@ function atr(candles, period = 14) {
 }
 
 function getCurrentPrice(symbol) {
+  if (!validateSymbol(symbol)) return null;
   try {
-    const out  = hlCmd(`price ${symbol}-PERP --json`);
+    const out  = hlCmd('price', `${symbol}-PERP`, '--json');
     const data = JSON.parse(out);
-    return parseFloat(data.markPrice ?? data.price ?? 0);
+    const v = parseFloat(data.markPrice ?? data.price ?? 0);
+    return Number.isFinite(v) && v > 0 ? v : null;
   } catch {
     return null;
   }
 }
 
 function updateSL(symbol, side, size, newSLPrice, mode) {
+  if (!validateSymbol(symbol)) { console.error(`    ✗ Invalid symbol: ${symbol}`); return; }
   if (mode === 'dry-run') {
     console.log(`    [DRY-RUN] Update SL for ${symbol} → ${newSLPrice}`);
     return;
   }
   try {
     const closeSide = side === 'buy' ? 'sell' : 'buy';
-    hlCmd(`perp order ${symbol}-PERP --side ${closeSide} --size ${size} --reduce-only --order-type stop --trigger-price ${newSLPrice}`);
+    hlCmd('perp', 'order', `${symbol}-PERP`,
+      '--side', closeSide,
+      '--size', String(size),
+      '--reduce-only',
+      '--order-type', 'stop',
+      '--trigger-price', String(newSLPrice));
     console.log(`    ✓ SL updated to ${newSLPrice}`);
   } catch (e) {
     console.error(`    ✗ SL update failed: ${e.message}`);
@@ -144,13 +140,14 @@ function updateSL(symbol, side, size, newSLPrice, mode) {
 }
 
 function closePosition(symbol, size, mode, reason) {
+  if (!validateSymbol(symbol)) { console.error(`    ✗ Invalid symbol: ${symbol}`); return false; }
   console.log(`    Closing ${symbol}: ${reason}`);
   if (mode === 'dry-run') {
     console.log(`    [DRY-RUN] Would close ${symbol}`);
     return true;
   }
   try {
-    hlCmd(`perp close ${symbol}-PERP`);
+    hlCmd('perp', 'close', `${symbol}-PERP`);
     console.log(`    ✓ Position closed`);
     return true;
   } catch (e) {
@@ -218,6 +215,20 @@ async function checkPositions() {
   console.log(`[RISK] Managing ${posEntries.length} open position(s)...`);
 
   for (const [symbol, pos] of posEntries) {
+    // Backfill missing openedAt so an age-less position doesn't live forever.
+    if (!Number.isFinite(pos.openedAt)) {
+      pos.openedAt = Date.now();
+      state.positions[symbol].openedAt = pos.openedAt;
+      saveState(state);
+    }
+
+    // Skip positions that executor flagged as orphaned — require human intervention.
+    if (pos.status === 'ORPHAN_NO_SL') {
+      console.log(`\n  ── ${pos.direction} ${symbol} ──`);
+      console.error(`    ⚠ ORPHAN_NO_SL flagged — skipping automated management. ${pos.alert ?? ''}`);
+      continue;
+    }
+
     console.log(`\n  ── ${pos.direction} ${symbol} ──`);
 
     // Fetch current price and market data
@@ -255,8 +266,9 @@ async function checkPositions() {
     const isLong     = pos.direction === 'LONG';
     const priceDiff  = isLong ? currentPrice - pos.entryPrice : pos.entryPrice - currentPrice;
     const pnlPct     = (priceDiff / pos.entryPrice) * 100;
-    const pnlUsd     = priceDiff * pos.size * pos.leverage;
-    const ageMs      = Date.now() - (pos.openedAt ?? Date.now());
+    // PnL in USD = price_diff × quantity. Leverage affects margin, NOT absolute PnL.
+    const pnlUsd     = priceDiff * pos.size;
+    const ageMs      = Date.now() - pos.openedAt;
     const ageMin     = Math.round(ageMs / 60_000);
     const R          = pos.slDistance;
     const priceMoveR = priceDiff / R;
@@ -323,7 +335,8 @@ async function checkPositions() {
         console.log(`    Step-lock: $${(pos.stepLocked ?? 0).toFixed(2)} → $${newStepLock.toFixed(2)}`);
         state.positions[symbol].stepLocked = newStepLock;
         // Ensure SL locks in the step-locked profit (convert to price)
-        const lockedPriceDiff = (newStepLock - RISK_CONFIG.stepLockAmount) / (pos.size * pos.leverage);
+        // Price diff needed = USD to lock / quantity (leverage doesn't scale PnL).
+        const lockedPriceDiff = (newStepLock - RISK_CONFIG.stepLockAmount) / pos.size;
         const lockedSL = isLong
           ? pos.entryPrice + lockedPriceDiff
           : pos.entryPrice - lockedPriceDiff;
@@ -370,8 +383,8 @@ function checkCircuitBreakers() {
   if (state.dailyLoss >= RISK_CONFIG.dailyLossLimitPct) {
     alerts.push(`⚠ DAILY LOSS LIMIT: ${state.dailyLoss.toFixed(2)}% >= ${RISK_CONFIG.dailyLossLimitPct}%`);
   }
-  if (state.consecutiveLosses >= 5) {
-    alerts.push(`⚠ CONSECUTIVE LOSSES: ${state.consecutiveLosses} — 30min cooldown active`);
+  if (state.consecutiveLosses >= RISK_CONFIG.maxConsecutiveLosses) {
+    alerts.push(`⚠ CONSECUTIVE LOSSES: ${state.consecutiveLosses} — cooldown active`);
   }
 
   if (alerts.length > 0) {
@@ -396,8 +409,10 @@ function showStatus() {
   console.log(`Consec. losses:  ${state.consecutiveLosses}`);
   console.log(`Open positions:  ${Object.keys(state.positions).length}`);
   for (const [sym, pos] of Object.entries(state.positions)) {
-    const ageMin = Math.round((Date.now() - (pos.openedAt ?? Date.now())) / 60_000);
-    console.log(`  ${pos.direction} ${sym} | SL: ${pos.slPrice} | Phase: ${pos.phase} | ${ageMin}min`);
+    const openedAt = Number.isFinite(pos.openedAt) ? pos.openedAt : Date.now();
+    const ageMin = Math.round((Date.now() - openedAt) / 60_000);
+    const flag = pos.status === 'ORPHAN_NO_SL' ? ' ⚠ ORPHAN' : '';
+    console.log(`  ${pos.direction} ${sym} | SL: ${pos.slPrice} | Phase: ${pos.phase} | ${ageMin}min${flag}`);
   }
   console.log('════════════════════════════');
 }

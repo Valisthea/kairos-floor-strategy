@@ -38,7 +38,7 @@ node scripts/market-data.mjs ping
 # Run one cycle (paper trading by default)
 node scripts/kairos-engine.mjs cycle --symbols BTC,ETH,SOL
 
-# Run autonomously for 2 hours
+# Run autonomously for up to 8 hours (1-480 min)
 node scripts/kairos-engine.mjs auto --duration 120
 
 # Manage open positions (run every 30s during trading)
@@ -46,15 +46,26 @@ node scripts/risk-manager.mjs check-positions
 
 # Switch to live trading (requires explicit confirmation)
 node scripts/config.mjs set-mode live --confirm
+
+# Switch back to paper trading
+node scripts/config.mjs set-mode dry-run
+
+# Emergency stop (halts cycle + auto at next boundary)
+touch .kairos-data/HALT     # create
+rm .kairos-data/HALT        # resume
 ```
 
 ## Safety First
 
 - **Dry-run mode is the default.** No real orders are placed until you explicitly run `config.mjs set-mode live --confirm`.
-- Every position has a stop-loss.
+- **Mode is read from persisted state only** — there is no `--mode` CLI override. This prevents accidental live trading.
+- **Kill switch:** create `.kairos-data/HALT` to halt trading at the next cycle boundary without killing the process.
+- Every position has a stop-loss. If SL placement fails, the engine emergency-closes the position.
 - Circuit breakers: daily loss cap (5%), consecutive loss cap (5), max drawdown (15%).
 - Step-lock protection locks in every $2 of profit.
 - Time stop: positions auto-close after 120 minutes.
+- All state writes are atomic (tmp + rename) so a crash mid-write cannot corrupt state.
+- All CLI arguments to the Hyperliquid binary are passed as discrete argv entries — no shell, no split-on-whitespace.
 
 ## Risk Disclaimer
 
