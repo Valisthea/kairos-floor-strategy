@@ -1,0 +1,10 @@
+# Runtime state (not for version control)
+.kairos-data/
+
+# Node
+node_modules/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
