@@ -4,7 +4,7 @@ version: "1.0.0"
 description: "Autonomous 7-agent AI trading strategy for Hyperliquid perpetual futures — multi-timeframe confluence scoring, conviction-based sizing, and adaptive risk management"
 author:
   name: "Kairos Lab"
-  github: "kairos-lab"
+  github: "Valisthea"
 license: MIT
 category: trading-strategy
 tags:

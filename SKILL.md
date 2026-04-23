@@ -151,10 +151,10 @@ hyperliquid perp order BTC-PERP --side sell --size <SIZE> --trigger-price <SL_PR
 
 ### Full Auto Cycle (recommended)
 
-Run one complete analysis + execution cycle:
+Run one complete analysis + execution cycle (mode is read from persisted config — dry-run by default):
 
 ```
-node scripts/kairos-engine.mjs cycle --symbols BTC,ETH,SOL --mode dry-run
+node scripts/kairos-engine.mjs cycle --symbols BTC,ETH,SOL
 ```
 
 **When to use**: When the user says "analyze the market", "find trades", "run KAIROS", or "trade for me".
