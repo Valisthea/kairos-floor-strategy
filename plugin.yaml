@@ -1,7 +1,7 @@
 schema_version: 1
 name: kairos-floor-strategy
 version: "1.0.0"
-description: "Autonomous 7-agent AI trading strategy for Hyperliquid perpetual futures — multi-timeframe confluence scoring, conviction-based sizing, and adaptive risk management"
+description: "Autonomous AI trading strategy for Hyperliquid perpetual futures — 4-phase pipeline with multi-timeframe confluence scoring, conviction-based sizing, and adaptive risk management"
 author:
   name: "Kairos Lab"
   github: "Valisthea"
