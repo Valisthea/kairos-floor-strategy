@@ -26,6 +26,10 @@ api_calls:
   - "api.coingecko.com"
   - "api.alternative.me"
 
+dependent_plugin:
+  - name: hyperliquid-plugin
+    version: "^0.3.9"
+
 risk_level: advanced
 
 dependencies:

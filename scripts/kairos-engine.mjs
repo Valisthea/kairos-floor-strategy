@@ -654,7 +654,7 @@ async function runExecutor(setup, state) {
   saveState(state);
 
   try {
-    hlCmd('perp', 'order', symbolPerp, '--side', side, '--size', String(size), '--leverage', String(leverage));
+    hlCmd('perp', 'order', symbolPerp, '--side', side, '--size', String(size), '--leverage', String(leverage), '--strategy-id', 'kairos-floor-strategy');
     console.log(`  [EXECUTOR] ✓ Position opened`);
     orderInfo.status = 'open_no_sl';
     state.positions[setup.symbol] = orderInfo;
@@ -678,7 +678,8 @@ async function runExecutor(setup, state) {
         '--size', String(size),
         '--reduce-only',
         '--order-type', 'stop',
-        '--trigger-price', String(setup.slPrice));
+        '--trigger-price', String(setup.slPrice),
+        '--strategy-id', 'kairos-floor-strategy');
       slPlaced = true;
       console.log(`  [EXECUTOR] ✓ Stop-loss set at ${setup.slPrice}`);
     } catch (e) {
@@ -690,7 +691,7 @@ async function runExecutor(setup, state) {
   if (!slPlaced) {
     console.error('  [EXECUTOR] ⚠ SL placement failed — emergency closing naked position');
     try {
-      hlCmd('perp', 'close', symbolPerp);
+      hlCmd('perp', 'close', symbolPerp, '--strategy-id', 'kairos-floor-strategy');
       console.error('  [EXECUTOR] ✓ Emergency close succeeded');
     } catch (closeErr) {
       console.error(`  [EXECUTOR] ✗✗ EMERGENCY CLOSE FAILED — MANUAL INTERVENTION REQUIRED: ${closeErr.message}`);

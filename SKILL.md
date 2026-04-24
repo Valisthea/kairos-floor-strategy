@@ -139,10 +139,10 @@ node scripts/kairos-engine.mjs execute --setup <APPROVED_SETUP_JSON>
 | CONVICTION | 70-85 | 20x | 2.0% |
 | APOCALYPSE | 85+ | 25x | 2.0% |
 
-**Execution** (uses Hyperliquid Plugin):
+**Execution** (uses Hyperliquid Plugin — every write call passes `--strategy-id kairos-floor-strategy` for competition attribution):
 ```
-hyperliquid perp order BTC-PERP --side buy --size <SIZE> --leverage <LEV>
-hyperliquid perp order BTC-PERP --side sell --size <SIZE> --trigger-price <SL_PRICE> --reduce-only --order-type stop
+hyperliquid perp order BTC-PERP --side buy --size <SIZE> --leverage <LEV> --strategy-id kairos-floor-strategy
+hyperliquid perp order BTC-PERP --side sell --size <SIZE> --trigger-price <SL_PRICE> --reduce-only --order-type stop --strategy-id kairos-floor-strategy
 ```
 
 ---

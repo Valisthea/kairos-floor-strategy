@@ -132,7 +132,8 @@ function updateSL(symbol, side, size, newSLPrice, mode) {
       '--size', String(size),
       '--reduce-only',
       '--order-type', 'stop',
-      '--trigger-price', String(newSLPrice));
+      '--trigger-price', String(newSLPrice),
+      '--strategy-id', 'kairos-floor-strategy');
     console.log(`    ✓ SL updated to ${newSLPrice}`);
   } catch (e) {
     console.error(`    ✗ SL update failed: ${e.message}`);
@@ -147,7 +148,7 @@ function closePosition(symbol, size, mode, reason) {
     return true;
   }
   try {
-    hlCmd('perp', 'close', `${symbol}-PERP`);
+    hlCmd('perp', 'close', `${symbol}-PERP`, '--strategy-id', 'kairos-floor-strategy');
     console.log(`    ✓ Position closed`);
     return true;
   } catch (e) {
